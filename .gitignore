@@ -1,0 +1,26 @@
+.venv/
+__pycache__/
+*.py[cod]
+
+.env
+.env.*
+
+# Generated subtitle/audio workflow data
+*.srt
+*.vtt
+*.ass
+*.mp3
+*.wav
+*.m4a
+*.aac
+*.flac
+*.ogg
+*.mp4
+*.mkv
+*.mov
+*.avi
+*.voice-report.json
+*.english-map.py
+**/*.txt-batch/
+**/voice_work/
+**/work/
