@@ -105,6 +105,55 @@ python .\srt_translate.py validate ".\Factory Method Pattern_ Easy Guide for Beg
 
 Nếu báo `Missing translations: 0` là đủ dòng dịch.
 
+## Tạo SRT Từ Video Bằng Web Upload
+
+Nếu video chưa có file `.srt`, có thể chạy local web app để upload video hoặc audio rồi tự tạo `.srt` theo timeline, sau đó app sẽ tiếp tục tạo `.vi.srt` bằng pipeline dịch hiện có.
+
+Cài thêm package cần thiết:
+
+```powershell
+pip install -r .\requirements.txt
+```
+
+Chạy web app local:
+
+```powershell
+python .\video_to_srt_web.py --host 127.0.0.1 --port 8765
+```
+
+Mở trình duyệt tại:
+
+```text
+http://127.0.0.1:8765
+```
+
+App sẽ:
+
+- nhận file video/audio upload
+- trích audio bằng `ffmpeg`
+- chia audio thành chunk 10 phút, overlap 1 giây
+- gọi backend OpenAI-compatible local để lấy segment có timestamp
+- ghép thành file `.srt` chuẩn timeline
+- gọi `srt_translate.py all` để tạo thêm `.vi.srt`
+
+Output mặc định:
+
+```text
+.\video_srt_outputs\<ten-video>\
+  <ten-video>.srt
+  <ten-video>.vi.srt
+  job-report.json
+  work\
+```
+
+Các tùy chọn hữu ích:
+
+```powershell
+python .\video_to_srt_web.py --output-dir .\my_outputs --transcribe-base-url http://localhost:20128/v1 --transcribe-model cx/gpt-5.5
+python .\video_to_srt_web.py --translate-base-url http://localhost:20128/v1 --translate-model cx/gpt-5.5
+```
+
+Nếu dịch tiếng Việt lỗi, app vẫn giữ file `.srt` gốc và ghi lỗi vào `job-report.json`.
 ## Tạo Phonetic English Map
 
 Trước khi tạo voice, nên tạo map phát âm cho các từ tiếng Anh/code như `Factory`, `Method`, `interface`, `object`.

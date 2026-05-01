@@ -24,3 +24,5 @@ __pycache__/
 **/*.txt-batch/
 **/voice_work/
 **/work/
+video_srt_outputs/
+video_srt_uploads/

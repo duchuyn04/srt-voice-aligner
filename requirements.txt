@@ -1,0 +1,6 @@
+﻿edge-tts
+fastapi
+openai
+pydub
+python-multipart
+uvicorn

@@ -27,6 +27,11 @@ DEFAULT_MODEL = "cx/gpt-5.5"
 DEFAULT_MODELS = [DEFAULT_MODEL]
 DEFAULT_TARGET_CPS = 17.0
 DEFAULT_MIN_CUE_CHARS = 24
+DEFAULT_SPLIT_MAX_CHARS = 48
+DEFAULT_SPLIT_MIN_DURATION_MS = 900
+DEFAULT_SPLIT_CPS = 13.5
+DEFAULT_SPLIT_PADDING_MS = 250
+DEFAULT_SPLIT_MAX_DURATION_MS = 2800
 
 RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503}
 TIMELINE_RE = re.compile(
@@ -40,6 +45,8 @@ TIMELINE_OUTPUT_RE = re.compile(
     r"^(?P<start>\d{2}:\d{2}:\d{2},\d{3})\s+-->\s+"
     r"(?P<end>\d{2}:\d{2}:\d{2},\d{3})(?P<rest>.*)$"
 )
+SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?\u2026])\s+")
+SOFT_CLAUSE_BOUNDARY_RE = re.compile(r"(?<=[,;:])\s+")
 TRAILING_TRANSITION_PHRASES = [
     "Bây giờ chúng ta hãy xem",
     "Bây giờ hãy cùng xem",
@@ -399,6 +406,8 @@ def translation_style_rules(target: str) -> str:
             "- Translate into natural Vietnamese subtitle style for a programming YouTube video.\n"
             "- Prioritize cue-by-cue alignment over smooth paragraph flow.\n"
             "- Keep each cue concise and easy to read aloud; avoid long academic phrasing.\n"
+            "- Do not use comma or period as Vietnamese punctuation in translated subtitle text. "
+            "Keep periods only inside required tokens such as .NET, URLs, file names, commands, or version numbers.\n"
             "- Keep each output id aligned to the same input id. Do not move ideas, clauses, sentence endings, or connector words to another id.\n"
             "- If an input cue is a sentence fragment, translate it as a concise fragment; do not complete it with text from nearby cues.\n"
             "- If an input cue ends mid-phrase, let the Vietnamese cue also be a natural fragment or shortened equivalent.\n"
@@ -660,6 +669,346 @@ def wrap_subtitle_text(text: str, width: int) -> list[str]:
         )
         wrapped_lines.extend(wrapped or [""])
     return wrapped_lines
+
+
+def compact_subtitle_text(text_lines: list[str]) -> str:
+    return re.sub(r"\s+", " ", " ".join(line.strip() for line in text_lines)).strip()
+
+
+def split_long_words(unit: str, max_chars: int) -> list[str]:
+    words = unit.split()
+    if not words:
+        return []
+    text_len = len(" ".join(words))
+    chunk_count = max(1, (text_len + max_chars - 1) // max_chars)
+    if chunk_count == 1:
+        return [" ".join(words)]
+
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    target_len = text_len / chunk_count
+
+    for index, word in enumerate(words):
+        if not current:
+            current.append(word)
+            current_len = len(word)
+            continue
+
+        next_len = current_len + 1 + len(word)
+        remaining_words = len(words) - index
+        remaining_chunks_after_close = chunk_count - len(chunks) - 1
+        can_close = remaining_chunks_after_close > 0 and remaining_words >= remaining_chunks_after_close
+        if can_close and next_len > target_len:
+            current_diff = abs(target_len - current_len)
+            next_diff = abs(target_len - next_len)
+            if current_diff <= next_diff:
+                chunks.append(" ".join(current))
+                current = [word]
+                current_len = len(word)
+                continue
+
+        if len(chunks) < chunk_count - 1:
+            current.append(word)
+            current_len = next_len
+        else:
+            current.append(word)
+            current_len = next_len
+
+    if current:
+        chunks.append(" ".join(current))
+    return chunks
+
+
+def merge_short_timed_segments(
+    segments: list[str],
+    duration_ms: int,
+    min_duration_ms: int,
+) -> list[str]:
+    if len(segments) <= 1 or min_duration_ms <= 0:
+        return segments
+
+    segments = list(segments)
+    while len(segments) > 1:
+        weights = [max(1, len(segment.strip())) for segment in segments]
+        total_weight = sum(weights)
+        estimated_durations = [
+            duration_ms * weight / total_weight
+            for weight in weights
+        ]
+        shortest_index = min(range(len(segments)), key=lambda index: estimated_durations[index])
+        if estimated_durations[shortest_index] >= min_duration_ms:
+            break
+
+        if shortest_index == 0:
+            merge_index = 0
+        elif shortest_index == len(segments) - 1:
+            merge_index = shortest_index - 1
+        else:
+            previous_len = len(segments[shortest_index - 1])
+            next_len = len(segments[shortest_index + 1])
+            merge_index = shortest_index - 1 if previous_len <= next_len else shortest_index
+
+        segments[merge_index : merge_index + 2] = [
+            f"{segments[merge_index]} {segments[merge_index + 1]}".strip()
+        ]
+
+    return segments
+
+
+def split_text_units(text: str, max_chars: int) -> list[str]:
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return [""]
+
+    units: list[str] = []
+    for sentence in SENTENCE_BOUNDARY_RE.split(text):
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        if len(sentence) <= max_chars:
+            units.append(sentence)
+            continue
+
+        for clause in SOFT_CLAUSE_BOUNDARY_RE.split(sentence):
+            clause = clause.strip()
+            if not clause:
+                continue
+            if len(clause) <= max_chars:
+                units.append(clause)
+            else:
+                units.extend(split_long_words(clause, max_chars))
+    return units or [text]
+
+
+def pack_text_units(units: list[str], max_chars: int) -> list[str]:
+    segments: list[str] = []
+    current = ""
+
+    for unit in units:
+        unit = unit.strip()
+        if not unit:
+            continue
+        if not current:
+            current = unit
+        elif len(current) + 1 + len(unit) <= max_chars:
+            current = f"{current} {unit}"
+        else:
+            segments.append(current)
+            current = unit
+
+    if current:
+        segments.append(current)
+    return segments or [""]
+
+
+def limit_segment_count(segments: list[str], max_segments: int) -> list[str]:
+    if max_segments <= 0:
+        return segments
+
+    segments = list(segments)
+    while len(segments) > max_segments:
+        best_index = 0
+        best_len = len(segments[0]) + 1 + len(segments[1])
+        for index in range(1, len(segments) - 1):
+            combined_len = len(segments[index]) + 1 + len(segments[index + 1])
+            if combined_len < best_len:
+                best_index = index
+                best_len = combined_len
+        segments[best_index : best_index + 2] = [
+            f"{segments[best_index]} {segments[best_index + 1]}".strip()
+        ]
+    return segments
+
+
+def split_subtitle_text(text: str, max_chars: int, max_segments: int) -> list[str]:
+    units = split_text_units(text, max_chars=max_chars)
+    segments = pack_text_units(units, max_chars=max_chars)
+    return limit_segment_count(segments, max_segments=max_segments)
+
+
+def split_timeline_for_segments(timeline: str, segments: list[str]) -> list[str]:
+    if len(segments) <= 1:
+        return [timeline]
+
+    start_ms, end_ms, rest = timeline_parts(timeline)
+    duration_ms = max(1, end_ms - start_ms)
+    weights = [max(1, len(segment.strip())) for segment in segments]
+    total_weight = sum(weights)
+
+    boundaries = [start_ms]
+    elapsed_weight = 0
+    for index, weight in enumerate(weights[:-1], start=1):
+        elapsed_weight += weight
+        boundary = start_ms + round(duration_ms * elapsed_weight / total_weight)
+        minimum = boundaries[-1] + 1
+        maximum = end_ms - (len(segments) - index)
+        boundaries.append(max(minimum, min(boundary, maximum)))
+    boundaries.append(end_ms)
+
+    return [
+        format_timeline(boundaries[index], boundaries[index + 1], rest)
+        for index in range(len(segments))
+    ]
+
+
+def estimated_segment_duration_ms(
+    text: str,
+    chars_per_second: float,
+    min_duration_ms: int,
+    max_duration_ms: int,
+    padding_ms: int,
+) -> int:
+    cps = max(1.0, chars_per_second)
+    duration = int(round((len(text.strip()) / cps) * 1000)) + padding_ms
+    if max_duration_ms > 0:
+        duration = min(duration, max_duration_ms)
+    return max(1, max(min_duration_ms, duration))
+
+
+def compact_timeline_for_segments(
+    timeline: str,
+    segments: list[str],
+    chars_per_second: float,
+    min_duration_ms: int,
+    max_duration_ms: int,
+    padding_ms: int,
+) -> list[str]:
+    start_ms, end_ms, rest = timeline_parts(timeline)
+    duration_ms = max(1, end_ms - start_ms)
+    if len(segments) <= 1:
+        segment_text = segments[0] if segments else ""
+        capped_duration = estimated_segment_duration_ms(
+            segment_text,
+            chars_per_second=chars_per_second,
+            min_duration_ms=min_duration_ms,
+            max_duration_ms=max_duration_ms,
+            padding_ms=padding_ms,
+        )
+        return [format_timeline(start_ms, min(end_ms, start_ms + capped_duration), rest)]
+
+    durations = [
+        estimated_segment_duration_ms(
+            segment,
+            chars_per_second=chars_per_second,
+            min_duration_ms=min_duration_ms,
+            max_duration_ms=max_duration_ms,
+            padding_ms=padding_ms,
+        )
+        for segment in segments
+    ]
+
+    if sum(durations) > duration_ms:
+        return split_timeline_for_segments(timeline, segments)
+
+    timelines: list[str] = []
+    cursor_ms = start_ms
+    for duration in durations:
+        segment_end_ms = min(end_ms, cursor_ms + duration)
+        timelines.append(format_timeline(cursor_ms, segment_end_ms, rest))
+        cursor_ms = segment_end_ms
+    return timelines
+
+
+def split_long_cues(
+    cues: list[dict[str, Any]],
+    max_chars: int,
+    min_duration_ms: int,
+    wrap: int,
+    timing_mode: str,
+    chars_per_second: float,
+    max_duration_ms: int,
+    padding_ms: int,
+) -> tuple[list[str], dict[str, int]]:
+    blocks: list[str] = []
+    split_count = 0
+    longest_chars = 0
+    next_index = 1
+
+    for cue in cues:
+        text = compact_subtitle_text(list(cue["text_lines"]))
+        start_ms, end_ms, _ = timeline_parts(str(cue["timeline"]))
+        duration_ms = max(1, end_ms - start_ms)
+        max_segments = (
+            max(1, duration_ms // min_duration_ms)
+            if min_duration_ms > 0
+            else max(1, len(text))
+        )
+
+        if text and len(text) > max_chars and max_segments > 1:
+            segments = split_subtitle_text(
+                text,
+                max_chars=max_chars,
+                max_segments=max_segments,
+            )
+            segments = merge_short_timed_segments(
+                segments,
+                duration_ms=duration_ms,
+                min_duration_ms=min_duration_ms,
+            )
+        else:
+            segments = [text]
+
+        if timing_mode == "compact":
+            timelines = compact_timeline_for_segments(
+                str(cue["timeline"]),
+                segments,
+                chars_per_second=chars_per_second,
+                min_duration_ms=min_duration_ms,
+                max_duration_ms=max_duration_ms,
+                padding_ms=padding_ms,
+            )
+        else:
+            timelines = split_timeline_for_segments(str(cue["timeline"]), segments)
+        if len(segments) > 1:
+            split_count += 1
+
+        for timeline, segment in zip(timelines, segments):
+            longest_chars = max(longest_chars, len(segment))
+            text_lines = wrap_subtitle_text(segment, width=wrap)
+            blocks.append("\n".join([str(next_index), timeline, *text_lines]))
+            next_index += 1
+
+    stats = {
+        "source_cues": len(cues),
+        "output_cues": len(blocks),
+        "split_cues": split_count,
+        "added_cues": len(blocks) - len(cues),
+        "longest_chars": longest_chars,
+    }
+    return blocks, stats
+
+
+def command_split_long(args: argparse.Namespace) -> None:
+    source = Path(args.srt_file)
+    output = Path(args.output) if args.output else source.with_name(f"{source.stem}.split.srt")
+    cues = parse_srt(source)
+    if not cues:
+        raise SrtToolError(f"No cues found in {source}")
+
+    blocks, stats = split_long_cues(
+        cues,
+        max_chars=max(1, int(args.max_chars)),
+        min_duration_ms=max(0, int(args.min_duration_ms)),
+        wrap=max(0, int(args.wrap)),
+        timing_mode=args.timing_mode,
+        chars_per_second=float(args.chars_per_second),
+        max_duration_ms=max(0, int(args.max_duration_ms)),
+        padding_ms=max(0, int(args.padding_ms)),
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text("\n\n".join(blocks) + "\n", encoding="utf-8", newline="\n")
+
+    output_cues = parse_srt(output)
+    overlaps = find_overlapping_timelines(output_cues)
+
+    print(f"Split long cues into {output}")
+    print(f"Source cues: {stats['source_cues']}")
+    print(f"Output cues: {stats['output_cues']}")
+    print(f"Split cues: {stats['split_cues']}")
+    print(f"Added cues: {stats['added_cues']}")
+    print(f"Longest output cue chars: {stats['longest_chars']}")
+    print(f"Output timeline overlaps: {len(overlaps)}")
 
 
 def rebalance_trailing_transitions_by_id(
@@ -1012,6 +1361,59 @@ def build_parser() -> argparse.ArgumentParser:
     )
     merge.add_argument("--allow-missing", action="store_true", help="Allow missing translated cues as blank text")
     merge.set_defaults(func=command_merge)
+
+    split_long = subparsers.add_parser(
+        "split-long",
+        help="Split long SRT cues into shorter timeline-preserving cues",
+    )
+    split_long.add_argument("srt_file")
+    split_long.add_argument("--output", help="Output SRT path, default is <input stem>.split.srt")
+    split_long.add_argument(
+        "--max-chars",
+        type=int,
+        default=DEFAULT_SPLIT_MAX_CHARS,
+        help=f"Target maximum characters per split cue, default is {DEFAULT_SPLIT_MAX_CHARS}",
+    )
+    split_long.add_argument(
+        "--min-duration-ms",
+        type=int,
+        default=DEFAULT_SPLIT_MIN_DURATION_MS,
+        help=(
+            "Minimum duration budget for each split cue; prevents over-splitting short cues, "
+            f"default is {DEFAULT_SPLIT_MIN_DURATION_MS}"
+        ),
+    )
+    split_long.add_argument(
+        "--wrap",
+        type=int,
+        default=0,
+        help="Wrap each output cue line to this width; 0 disables wrapping",
+    )
+    split_long.add_argument(
+        "--timing-mode",
+        choices=["compact", "distribute"],
+        default="compact",
+        help="compact shows split parts near the original start and leaves silence blank; distribute fills the original cue duration",
+    )
+    split_long.add_argument(
+        "--chars-per-second",
+        type=float,
+        default=DEFAULT_SPLIT_CPS,
+        help=f"Reading speed used by compact timing, default is {DEFAULT_SPLIT_CPS}",
+    )
+    split_long.add_argument(
+        "--max-duration-ms",
+        type=int,
+        default=DEFAULT_SPLIT_MAX_DURATION_MS,
+        help=f"Maximum duration for each compact split cue, default is {DEFAULT_SPLIT_MAX_DURATION_MS}",
+    )
+    split_long.add_argument(
+        "--padding-ms",
+        type=int,
+        default=DEFAULT_SPLIT_PADDING_MS,
+        help=f"Extra display time for each compact split cue, default is {DEFAULT_SPLIT_PADDING_MS}",
+    )
+    split_long.set_defaults(func=command_split_long)
 
     all_cmd = subparsers.add_parser("all", help="Run extract, translate, and merge")
     all_cmd.add_argument("srt_file")
